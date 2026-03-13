@@ -20,6 +20,9 @@
 ;; - View traffic logs for debugging
 ;; - Auto-refresh every 2 seconds
 ;; - Killed processes are displayed at the bottom in red
+;; - Preview mode: split view with live buffer preview (p to enter, q to exit)
+;; - Project grouping: buffers grouped by project root with visual headers
+;; - Status filtering: cycle through status filters (f to cycle)
 ;;
 ;; Usage:
 ;;   M-x agent-shell-manager-toggle
@@ -36,7 +39,9 @@
 ;;   C-c C-c - Interrupt agent
 ;;   t     - View traffic logs
 ;;   l     - Toggle logging
-;;   q     - Quit manager window
+;;   p     - Enter preview mode
+;;   f     - Cycle status filter
+;;   q     - Quit (context-aware: exits preview or closes manager)
 
 ;;; Code:
 
@@ -89,22 +94,42 @@ the manager window can also be closed by `delete-other-windows' (C-x 1)."
 (defvar agent-shell-manager--global-buffer nil
   "The global manager buffer for `agent-shell' buffer list.")
 
+;; ============================================================
+;; Preview Mode
+;; ============================================================
+
+(defvar agent-shell-manager-preview-active nil
+  "Non-nil when preview mode is active.")
+
+(defvar agent-shell-manager-preview-saved-config nil
+  "Window configuration saved before entering preview mode.")
+
+(defvar agent-shell-manager-preview-buffer nil
+  "Buffer currently being previewed.")
+
+(defvar agent-shell-manager-preview-highlight-overlay nil
+  "Overlay used to highlight the current row during preview mode.")
+
+(defface agent-shell-manager-preview-highlight
+  '((t :background "#3c3836" :extend t))
+  "Face for the currently previewed entry in the manager.")
+
+;; ============================================================
+;; Status Filtering
+;; ============================================================
+
+(defvar agent-shell-manager-filter-status nil
+  "Current status filter. nil = show all.")
+
+(defvar agent-shell-manager-filter-cycle '(nil "Working" "Waiting" "Ready" "Killed")
+  "Cycle of filter values. nil means show all.")
+
+;; ============================================================
+;; Mode Definition
+;; ============================================================
+
 (define-derived-mode agent-shell-manager-mode tabulated-list-mode "Agent-Shell-Buffers"
   "Major mode for listing `agent-shell' buffers.
-
-Key bindings:
-\\[agent-shell-manager-goto] - Switch to `agent-shell' buffer at point
-\\[agent-shell-manager-refresh] - Refresh the buffer list
-\\[agent-shell-manager-kill] - Kill the `agent-shell' process at point
-\\[agent-shell-manager-new] - Create a new `agent-shell'
-\\[agent-shell-manager-restart] - Restart the `agent-shell' at point
-\\[agent-shell-manager-delete-killed] - Delete all killed `agent-shell' buffers
-\\[agent-shell-manager-set-mode] - Set session mode for agent at point
-\\[agent-shell-manager-set-model] - Set session model for agent at point
-\\[agent-shell-manager-interrupt] - Interrupt the agent at point
-\\[agent-shell-manager-view-traffic] - View traffic logs for agent at point
-\\[agent-shell-manager-toggle-logging] - Toggle ACP logging
-\\[quit-window] - Quit the manager window
 
 \\{agent-shell-manager-mode-map}"
   (setq tabulated-list-format
@@ -125,6 +150,9 @@ Key bindings:
   (setq agent-shell-manager--refresh-timer
         (run-with-timer 2 2 #'agent-shell-manager-refresh))
 
+  ;; Skip group header lines during navigation
+  (add-hook 'post-command-hook #'agent-shell-manager--skip-group-headers nil t)
+
   ;; Cancel timer when buffer is killed
   (add-hook 'kill-buffer-hook
             (lambda ()
@@ -132,6 +160,10 @@ Key bindings:
                 (cancel-timer agent-shell-manager--refresh-timer)
                 (setq agent-shell-manager--refresh-timer nil)))
             nil t))
+
+;; ============================================================
+;; Status Helpers
+;; ============================================================
 
 (defun agent-shell-manager--get-status (buffer)
   "Get the current status of `agent-shell' BUFFER.
@@ -144,33 +176,26 @@ Returns one of: waiting, ready, working, killed, or unknown."
              (acp-process-alive (and acp-proc
                                      (processp acp-proc)
                                      (process-live-p acp-proc)
-                                     ;; Additional check: process status should not be 'exit or 'signal
                                      (memq (process-status acp-proc) '(run open listen connect stop))))
-             ;; Check the comint process (the actual shell process)
              (comint-proc (get-buffer-process (current-buffer)))
              (comint-process-alive (and comint-proc
                                         (processp comint-proc)
                                         (process-live-p comint-proc)
                                         (memq (process-status comint-proc) '(run open listen connect stop))))
-             ;; Both processes must be alive for the shell to be truly alive
              (process-alive (and acp-process-alive comint-process-alive)))
         (cond
-         ;; Check if comint process is dead or missing - if so, always report killed
          ((or (not comint-proc)
               (and (processp comint-proc)
                    (not comint-process-alive)))
           "killed")
-         ;; Check if ACP client process is dead or missing (when client exists)
          ((and (map-elt state :client)
                (or (not acp-proc)
                    (and (processp acp-proc)
                         (not acp-process-alive))))
           "killed")
-         ;; Check if there are pending tool calls
          ((and process-alive
                (map-elt state :tool-calls)
                (> (length (map-elt state :tool-calls)) 0))
-          ;; Check if any tool call is pending permission
           (let ((has-pending-permission
                  (seq-find (lambda (tool-call)
                              (map-elt (cdr tool-call) :permission-request-id))
@@ -178,16 +203,13 @@ Returns one of: waiting, ready, working, killed, or unknown."
             (if has-pending-permission
                 "waiting"
               "working")))
-         ;; Check if buffer is busy (shell-maker function)
          ((and process-alive
                (fboundp 'shell-maker-busy)
                (shell-maker-busy))
           "working")
-         ;; Check if session is active (only if process is alive)
          ((and process-alive
                (map-nested-elt state '(:session :id)))
           "ready")
-         ;; Still initializing
          ((not (map-elt state :initialized))
           "initializing")
          (t "unknown"))))))
@@ -208,34 +230,26 @@ Returns one of: waiting, ready, working, killed, or unknown."
           "none")))))
 
 (defun agent-shell-manager--get-combined-status (buffer)
-  "Get combined status for BUFFER that merges operational and session state.
-Returns a user-friendly status string with appropriate face."
+  "Get combined status for BUFFER that merges operational and session state."
   (with-current-buffer buffer
     (let ((status (agent-shell-manager--get-status buffer))
           (session (agent-shell-manager--get-session-status buffer)))
       (cond
-       ;; Killed - highest priority
        ((string= status "killed")
         (propertize "Killed" 'face 'error))
-       ;; Initializing without session
        ((and (string= status "initializing")
              (string= session "none"))
         (propertize "Starting..." 'face 'font-lock-comment-face))
-       ;; Ready but no session (edge case)
        ((and (string= status "ready")
              (string= session "none"))
         (propertize "No Session" 'face 'font-lock-comment-face))
-       ;; Ready with active session
        ((and (string= status "ready")
              (string= session "active"))
         (propertize "Ready" 'face 'success))
-       ;; Working
        ((string= status "working")
         (propertize "Working" 'face 'warning))
-       ;; Waiting for user input/permission
        ((string= status "waiting")
         (propertize "Waiting" 'face 'font-lock-keyword-face))
-       ;; Unknown/fallback
        (t
         (propertize "Unknown" 'face 'font-lock-comment-face))))))
 
@@ -254,8 +268,6 @@ Returns a user-friendly status string with appropriate face."
   "Get the agent kind for BUFFER by parsing the buffer name."
   (with-current-buffer buffer
     (let ((buffer-name (buffer-name)))
-      ;; Buffer names are in the format: "Agent Name Agent @ /path/to/dir"
-      ;; Extract the agent name before " Agent @ "
       (if (string-match "^\\(.*?\\) Agent @ " buffer-name)
           (match-string 1 buffer-name)
         "-"))))
@@ -275,8 +287,7 @@ Returns a user-friendly status string with appropriate face."
       "-")))
 
 (defun agent-shell-manager--count-pending-permissions (buffer)
-  "Count the number of pending permission requests for BUFFER.
-Returns a propertized string with yellow/warning face for non-zero counts."
+  "Count the number of pending permission requests for BUFFER."
   (with-current-buffer buffer
     (if (and (boundp 'agent-shell--state)
              (map-elt agent-shell--state :tool-calls))
@@ -310,8 +321,27 @@ Returns a propertized string with yellow/warning face for non-zero counts."
   (with-current-buffer buffer
     default-directory))
 
+;; ============================================================
+;; Project Grouping
+;; ============================================================
+
+(defun agent-shell-manager--buffer-project-root (buffer)
+  "Get the project root for BUFFER.
+Uses projectile if available, falls back to `default-directory'."
+  (with-current-buffer buffer
+    (abbreviate-file-name
+     (or (and (fboundp 'projectile-project-root)
+              (ignore-errors (projectile-project-root)))
+         default-directory))))
+
+;; ============================================================
+;; Entries (with filtering + project sorting)
+;; ============================================================
+
 (defun agent-shell-manager--entries ()
-  "Return list of entries for tabulated-list."
+  "Return list of entries for tabulated-list.
+Applies status filtering and sorts by project root with killed buffers
+at the bottom of each group."
   (let* ((buffers (agent-shell-buffers))
          (buffers (if (listp buffers) buffers (list buffers)))
          (buffers (seq-filter #'buffer-live-p buffers))
@@ -331,32 +361,309 @@ Returns a propertized string with yellow/warning face for non-zero counts."
                               model
                               perms
                               path))))
-                   buffers)))
-    ;; Sort entries: killed processes go to the bottom
-    (sort entries
-          (lambda (a b)
-            (let ((status-a (aref (cadr a) 1))
-                  (status-b (aref (cadr b) 1)))
-              ;; Remove text properties to get plain status string
-              (setq status-a (substring-no-properties status-a))
-              (setq status-b (substring-no-properties status-b))
-              (cond
-               ;; Both killed or both not killed - maintain original order (stable)
-               ((and (string= status-a "Killed") (string= status-b "Killed")) nil)
-               ((and (not (string= status-a "Killed")) (not (string= status-b "Killed"))) nil)
-               ;; a is killed, b is not - a goes after b
-               ((string= status-a "Killed") nil)
-               ;; b is killed, a is not - a goes before b
-               (t t)))))))
+                   buffers))
+         ;; Apply status filter
+         (entries (if agent-shell-manager-filter-status
+                      (seq-filter
+                       (lambda (entry)
+                         (let ((status (substring-no-properties (aref (cadr entry) 1))))
+                           (string-equal-ignore-case status agent-shell-manager-filter-status)))
+                       entries)
+                    entries))
+         ;; Annotate with project root for sorting
+         (annotated (mapcar
+                     (lambda (entry)
+                       (let* ((buffer (car entry))
+                              (project (if (buffer-live-p buffer)
+                                           (agent-shell-manager--buffer-project-root buffer)
+                                         "~/")))
+                         (cons project entry)))
+                     entries)))
+    ;; Sort by project (alpha), killed-to-bottom within each group
+    (setq annotated
+          (sort annotated
+                (lambda (a b)
+                  (let ((proj-a (car a))
+                        (proj-b (car b))
+                        (status-a (substring-no-properties (aref (caddr a) 1)))
+                        (status-b (substring-no-properties (aref (caddr b) 1))))
+                    (cond
+                     ((not (string= proj-a proj-b))
+                      (string< proj-a proj-b))
+                     ((and (string= status-a "Killed") (not (string= status-b "Killed")))
+                      nil)
+                     ((and (not (string= status-a "Killed")) (string= status-b "Killed"))
+                      t)
+                     (t nil))))))
+    ;; Strip project annotations
+    (mapcar #'cdr annotated)))
+
+;; ============================================================
+;; Group Headers
+;; ============================================================
+
+(defun agent-shell-manager--inject-group-headers ()
+  "Insert visual group headers between project boundaries.
+Headers have `agent-shell-manager-group-header' text property for cleanup."
+  (when (derived-mode-p 'agent-shell-manager-mode)
+    (let ((inhibit-read-only t)
+          (last-project nil))
+      (save-excursion
+        (goto-char (point-min))
+        (while (not (eobp))
+          (let* ((entry-buffer (tabulated-list-get-id))
+                 (project (when (and entry-buffer (buffer-live-p entry-buffer))
+                            (agent-shell-manager--buffer-project-root entry-buffer))))
+            (when (and project (not (equal project last-project)))
+              (let* ((header-text (concat "-- " project " "
+                                          (make-string (max 1 (- 60 (length project) 4)) ?-)
+                                          "\n"))
+                     (propertized (propertize header-text
+                                             'face 'font-lock-comment-face
+                                             'agent-shell-manager-group-header t)))
+                (insert propertized))
+              (setq last-project project)))
+          (forward-line 1))))))
+
+(defun agent-shell-manager--remove-group-headers ()
+  "Remove all group header lines from the manager buffer."
+  (when (derived-mode-p 'agent-shell-manager-mode)
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (goto-char (point-min))
+        (while (not (eobp))
+          (if (get-text-property (point) 'agent-shell-manager-group-header)
+              (delete-region (line-beginning-position) (1+ (line-end-position)))
+            (forward-line 1)))))))
+
+(defun agent-shell-manager--skip-group-headers ()
+  "Post-command-hook to skip cursor past group header lines."
+  (when (and (derived-mode-p 'agent-shell-manager-mode)
+             (get-text-property (line-beginning-position) 'agent-shell-manager-group-header))
+    (let ((direction (cond
+                      ((memq this-command '(next-line evil-next-line evil-next-visual-line
+                                            evil-goto-line)) 1)
+                      ((memq this-command '(previous-line evil-previous-line evil-previous-visual-line
+                                            evil-goto-first-line)) -1)
+                      (t nil))))
+      (when direction
+        (forward-line direction)
+        (while (and (not (eobp)) (not (bobp))
+                    (get-text-property (line-beginning-position) 'agent-shell-manager-group-header))
+          (forward-line direction))
+        (when (eobp) (forward-line -1))))))
+
+;; ============================================================
+;; Refresh (with group headers, no scroll drift)
+;; ============================================================
 
 (defun agent-shell-manager-refresh ()
-  "Refresh the buffer list."
+  "Refresh the buffer list with group headers.
+Preserves cursor position on the same entry. Only restores scroll
+position when the manager window is actively selected to prevent
+drift from the auto-refresh timer."
   (interactive)
   (when (and agent-shell-manager--global-buffer
              (buffer-live-p agent-shell-manager--global-buffer))
     (with-current-buffer agent-shell-manager--global-buffer
-      (setq tabulated-list-entries (agent-shell-manager--entries))
-      (tabulated-list-print t))))
+      (let* ((target-buf (tabulated-list-get-id))
+             (mgr-win (get-buffer-window (current-buffer)))
+             ;; Only track scroll when we're the selected window
+             (is-selected (eq mgr-win (selected-window)))
+             (line-offset (when (and is-selected mgr-win)
+                            (count-lines (window-start mgr-win) (point)))))
+        ;; Remove old headers, refresh data, re-inject headers
+        (agent-shell-manager--remove-group-headers)
+        (setq tabulated-list-entries (agent-shell-manager--entries))
+        (tabulated-list-print t)
+        (agent-shell-manager--inject-group-headers)
+        ;; Restore cursor to the same buffer entry
+        (when target-buf
+          (goto-char (point-min))
+          (let ((found nil))
+            (while (and (not found) (not (eobp)))
+              (if (eq (tabulated-list-get-id) target-buf)
+                  (setq found t)
+                (forward-line 1)))))
+        ;; Only restore scroll when we're the active window
+        (when (and is-selected mgr-win (window-live-p mgr-win) line-offset)
+          (set-window-start mgr-win
+                            (save-excursion
+                              (forward-line (- line-offset))
+                              (point))
+                            t))
+        ;; Re-apply highlight overlay if preview mode is active
+        (when agent-shell-manager-preview-active
+          (if (and agent-shell-manager-preview-highlight-overlay
+                   (overlay-buffer agent-shell-manager-preview-highlight-overlay))
+              (move-overlay agent-shell-manager-preview-highlight-overlay
+                            (line-beginning-position) (1+ (line-end-position)))
+            (setq agent-shell-manager-preview-highlight-overlay
+                  (make-overlay (line-beginning-position) (1+ (line-end-position))))
+            (overlay-put agent-shell-manager-preview-highlight-overlay
+                         'face 'agent-shell-manager-preview-highlight)
+            (overlay-put agent-shell-manager-preview-highlight-overlay 'priority 100)))))))
+
+;; ============================================================
+;; Status Filtering UI
+;; ============================================================
+
+(defun agent-shell-manager--update-header-line ()
+  "Update the manager buffer's header-line to show the current filter."
+  (when (and agent-shell-manager--global-buffer
+             (buffer-live-p agent-shell-manager--global-buffer))
+    (with-current-buffer agent-shell-manager--global-buffer
+      (setq header-line-format
+            (if agent-shell-manager-filter-status
+                (format " Filter: %s  [f to cycle]" agent-shell-manager-filter-status)
+              nil))
+      (unless agent-shell-manager-filter-status
+        (tabulated-list-init-header)))))
+
+(defun agent-shell-manager-cycle-filter ()
+  "Cycle through status filters. Updates header-line and refreshes."
+  (interactive)
+  (let* ((current-pos (cl-position agent-shell-manager-filter-status
+                                   agent-shell-manager-filter-cycle
+                                   :test #'equal))
+         (next-pos (mod (1+ (or current-pos -1)) (length agent-shell-manager-filter-cycle))))
+    (setq agent-shell-manager-filter-status (nth next-pos agent-shell-manager-filter-cycle))
+    (agent-shell-manager--update-header-line)
+    (agent-shell-manager-refresh)
+    (message "Filter: %s" (or agent-shell-manager-filter-status "All"))))
+
+;; ============================================================
+;; Preview Mode
+;; ============================================================
+
+(defun agent-shell-manager--preview-window ()
+  "Find the preview window dynamically.
+Walks all windows and returns the one NOT showing the manager buffer."
+  (when agent-shell-manager-preview-active
+    (let ((mgr-buf (get-buffer "*Agent-Shell Buffers*"))
+          (result nil))
+      ;; First try: find window showing our preview buffer
+      (when agent-shell-manager-preview-buffer
+        (walk-windows
+         (lambda (w)
+           (when (and (not result)
+                      (not (eq (window-buffer w) mgr-buf))
+                      (eq (window-buffer w) agent-shell-manager-preview-buffer))
+             (setq result w)))
+         nil (selected-frame)))
+      ;; Fallback: any non-manager window
+      (unless result
+        (walk-windows
+         (lambda (w)
+           (when (and (not result)
+                      (not (eq (window-buffer w) mgr-buf)))
+             (setq result w)))
+         nil (selected-frame)))
+      result)))
+
+(defun agent-shell-manager--preview-update ()
+  "Update the preview pane to show the buffer under cursor.
+Called via `post-command-hook' in the manager buffer."
+  (when (and agent-shell-manager-preview-active
+             (derived-mode-p 'agent-shell-manager-mode))
+    ;; Update highlight overlay on current line
+    (if (and agent-shell-manager-preview-highlight-overlay
+             (overlay-buffer agent-shell-manager-preview-highlight-overlay))
+        (move-overlay agent-shell-manager-preview-highlight-overlay
+                      (line-beginning-position) (1+ (line-end-position)))
+      (setq agent-shell-manager-preview-highlight-overlay
+            (make-overlay (line-beginning-position) (1+ (line-end-position))))
+      (overlay-put agent-shell-manager-preview-highlight-overlay
+                   'face 'agent-shell-manager-preview-highlight)
+      (overlay-put agent-shell-manager-preview-highlight-overlay 'priority 100))
+    ;; Update preview pane
+    (when-let* ((buffer (tabulated-list-get-id)))
+      (when (buffer-live-p buffer)
+        (let ((preview-win (agent-shell-manager--preview-window))
+              (switched (not (eq buffer agent-shell-manager-preview-buffer))))
+          (when (and preview-win (window-live-p preview-win))
+            (setq agent-shell-manager-preview-buffer buffer)
+            (set-window-buffer preview-win buffer)
+            (when switched
+              (with-selected-window preview-win
+                (goto-char (point-max))
+                (recenter -3)))))))))
+
+(defun agent-shell-manager-enter-preview ()
+  "Enter preview mode.
+Saves window config, creates split layout with preview on top
+and manager on bottom (15 lines)."
+  (interactive)
+  (when agent-shell-manager-preview-active
+    (message "Already in preview mode")
+    (cl-return-from agent-shell-manager-enter-preview))
+  (setq agent-shell-manager-preview-saved-config (current-window-configuration))
+  (let ((mgr-buf (or agent-shell-manager--global-buffer
+                     (get-buffer "*Agent-Shell Buffers*"))))
+    (unless mgr-buf
+      (user-error "No manager buffer. Open it first with agent-shell-manager-toggle"))
+    ;; Close the manager's existing window first
+    (let ((mgr-win (get-buffer-window mgr-buf)))
+      (when (and mgr-win (window-live-p mgr-win))
+        (when (eq (selected-window) mgr-win)
+          (select-window (window-main-window)))
+        (delete-window mgr-win)))
+    ;; Clean slate
+    (delete-other-windows)
+    ;; Current window becomes the preview pane (top, large)
+    (let ((first-shell (car (agent-shell-buffers))))
+      (when first-shell
+        (setq agent-shell-manager-preview-buffer first-shell)
+        (set-window-buffer (selected-window) first-shell)))
+    ;; Split: bottom window for the manager
+    (let ((manager-win (split-window-below -15)))
+      (select-window manager-win)
+      (switch-to-buffer mgr-buf)
+      (agent-shell-manager-refresh)
+      (setq agent-shell-manager-preview-active t)
+      (add-hook 'post-command-hook #'agent-shell-manager--preview-update nil t)
+      (agent-shell-manager--preview-update)
+      (message "Preview mode: j/k navigate, RET select, q quit"))))
+
+(defun agent-shell-manager-exit-preview ()
+  "Exit preview mode and restore original window configuration."
+  (setq agent-shell-manager-preview-active nil)
+  (setq agent-shell-manager-preview-buffer nil)
+  (remove-hook 'post-command-hook #'agent-shell-manager--preview-update t)
+  (when (and agent-shell-manager-preview-highlight-overlay
+             (overlay-buffer agent-shell-manager-preview-highlight-overlay))
+    (delete-overlay agent-shell-manager-preview-highlight-overlay))
+  (setq agent-shell-manager-preview-highlight-overlay nil)
+  (when agent-shell-manager-preview-saved-config
+    (set-window-configuration agent-shell-manager-preview-saved-config)
+    (setq agent-shell-manager-preview-saved-config nil)))
+
+;; ============================================================
+;; Context-Aware Navigation
+;; ============================================================
+
+(defun agent-shell-manager-select ()
+  "Select the buffer at point.
+If in preview mode, exit it first."
+  (interactive)
+  (if agent-shell-manager-preview-active
+      (let ((buffer (tabulated-list-get-id)))
+        (agent-shell-manager-exit-preview)
+        (when (and buffer (buffer-live-p buffer))
+          (agent-shell-manager-goto)))
+    (agent-shell-manager-goto)))
+
+(defun agent-shell-manager-quit ()
+  "Context-aware quit.
+If preview mode is active, exit preview. Otherwise close normally."
+  (interactive)
+  (if agent-shell-manager-preview-active
+      (agent-shell-manager-exit-preview)
+    (quit-window)))
+
+;; ============================================================
+;; Window Management
+;; ============================================================
 
 (defun agent-shell-manager--hide-window ()
   "Hide the manager window if `agent-shell-manager-transient' is non-nil."
@@ -368,20 +675,15 @@ Returns a propertized string with yellow/warning face for non-zero counts."
 
 (defun agent-shell-manager-goto ()
   "Go to the `agent-shell' buffer at point.
-If `agent-shell-manager-transient' is non-nil, hide the manager window.
-If the buffer is already visible, switch to it.
-Otherwise, if another `agent-shell' window is open, reuse it."
+If `agent-shell-manager-transient' is non-nil, hide the manager window."
   (interactive)
   (when-let* ((buffer (tabulated-list-get-id)))
     (if (buffer-live-p buffer)
         (let ((buffer-window (get-buffer-window buffer t))
               (agent-shell-window nil))
           (cond
-           ;; If the buffer is already visible, just switch to it
            (buffer-window
             (select-window buffer-window))
-
-           ;; Otherwise, find an existing agent-shell window to reuse
            (t
             (walk-windows
              (lambda (win)
@@ -391,13 +693,10 @@ Otherwise, if another `agent-shell' window is open, reuse it."
                             (derived-mode-p 'agent-shell-mode)))
                  (setq agent-shell-window win)))
              nil t)
-
             (if agent-shell-window
-                ;; Reuse the existing agent-shell window
                 (progn
                   (set-window-buffer agent-shell-window buffer)
                   (select-window agent-shell-window))
-              ;; No existing agent-shell window, use default behavior
               (agent-shell--display-buffer buffer))))
           (agent-shell-manager--hide-window))
       (user-error "Buffer no longer exists"))))
@@ -417,7 +716,6 @@ Otherwise, if another `agent-shell' window is open, reuse it."
             (when (process-live-p proc)
               (comint-send-eof)
               (message "Sent EOF to agent-shell process in %s" (buffer-name buffer))))))
-      ;; Give the process a moment to update its status before refreshing
       (run-with-timer 0.1 nil #'agent-shell-manager-refresh))))
 
 (defun agent-shell-manager-new ()
@@ -429,10 +727,8 @@ Otherwise, if another `agent-shell' window is open, reuse it."
     (agent-shell-manager-refresh)))
 
 (defun agent-shell-manager--get-buffer-config (buffer)
-  "Try to determine the config used for BUFFER.
-Returns nil if config cannot be determined."
+  "Try to determine the config used for BUFFER."
   (with-current-buffer buffer
-    ;; Try to match buffer name against known configs
     (when (derived-mode-p 'agent-shell-mode)
       (let ((buffer-name-prefix (replace-regexp-in-string " Agent @ .*$" "" (buffer-name))))
         (seq-find (lambda (config)
@@ -440,8 +736,7 @@ Returns nil if config cannot be determined."
                   agent-shell-agent-configs)))))
 
 (defun agent-shell-manager-restart ()
-  "Restart the `agent-shell' at point.
-Kills the current process and starts a new one with the same config if possible."
+  "Restart the `agent-shell' at point."
   (interactive)
   (when-let* ((buffer (tabulated-list-get-id)))
     (unless (buffer-live-p buffer)
@@ -449,7 +744,6 @@ Kills the current process and starts a new one with the same config if possible.
     (let ((config (agent-shell-manager--get-buffer-config buffer))
           (buffer-name (buffer-name buffer)))
       (when (yes-or-no-p (format "Restart agent-shell %s? " buffer-name))
-        ;; Kill the current process
         (with-current-buffer buffer
           (when (and (boundp 'agent-shell--state)
                      (map-elt agent-shell--state :client)
@@ -457,9 +751,7 @@ Kills the current process and starts a new one with the same config if possible.
             (let ((proc (map-nested-elt agent-shell--state '(:client :process))))
               (when (process-live-p proc)
                 (kill-process proc)))))
-        ;; Kill the buffer
         (kill-buffer buffer)
-        ;; Start a new one
         (if config
             (agent-shell-start :config config)
           (agent-shell t))
@@ -539,22 +831,19 @@ Kills the current process and starts a new one with the same config if possible.
   (agent-shell-toggle-logging)
   (agent-shell-manager-refresh))
 
+;; ============================================================
+;; Toggle
+;; ============================================================
+
 ;;;###autoload
 (defun agent-shell-manager-toggle ()
-  "Toggle the `agent-shell' buffer list window.
-Shows buffer name, agent type, status (ready/waiting/working), session info, and mode.
-The position of the window is controlled by `agent-shell-manager-side'.
-When `agent-shell-manager-transient' is non-nil, the window can be closed
-by `delete-other-windows' (C-x 1)."
+  "Toggle the `agent-shell' buffer list window."
   (interactive)
   (let* ((buffer (get-buffer-create "*Agent-Shell Buffers*"))
          (window (get-buffer-window buffer)))
     (if (and window (window-live-p window))
-        ;; Window is visible, hide it
         (delete-window window)
-      ;; Window is not visible, show it
       (let ((window (if agent-shell-manager-side
-                        ;; Use side window with configured position
                         (let ((size-param (if (memq agent-shell-manager-side
                                                     '(left right))
                                               'window-width
@@ -572,13 +861,11 @@ by `delete-other-windows' (C-x 1)."
                              ,@(unless agent-shell-manager-transient
                                  '((window-parameters .
                                     ((no-delete-other-windows . t))))))))
-                      ;; Use regular window, let user's config control display
                       (display-buffer buffer))))
         (setq agent-shell-manager--global-buffer buffer)
         (with-current-buffer buffer
           (agent-shell-manager-mode)
           (agent-shell-manager-refresh))
-        ;; Make the window dedicated so it can't be used for other buffers
         (set-window-dedicated-p window t)
         (select-window window)))))
 
