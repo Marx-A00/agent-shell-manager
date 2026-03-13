@@ -594,36 +594,38 @@ Called via `post-command-hook' in the manager buffer."
 Saves window config, creates split layout with preview on top
 and manager on bottom (15 lines)."
   (interactive)
-  (when agent-shell-manager-preview-active
-    (message "Already in preview mode")
-    (cl-return-from agent-shell-manager-enter-preview))
-  (setq agent-shell-manager-preview-saved-config (current-window-configuration))
-  (let ((mgr-buf (or agent-shell-manager--global-buffer
-                     (get-buffer "*Agent-Shell Buffers*"))))
-    (unless mgr-buf
-      (user-error "No manager buffer. Open it first with agent-shell-manager-toggle"))
-    ;; Close the manager's existing window first
-    (let ((mgr-win (get-buffer-window mgr-buf)))
-      (when (and mgr-win (window-live-p mgr-win))
-        (when (eq (selected-window) mgr-win)
-          (select-window (window-main-window)))
-        (delete-window mgr-win)))
-    ;; Clean slate
-    (delete-other-windows)
-    ;; Current window becomes the preview pane (top, large)
-    (let ((first-shell (car (agent-shell-buffers))))
-      (when first-shell
-        (setq agent-shell-manager-preview-buffer first-shell)
-        (set-window-buffer (selected-window) first-shell)))
-    ;; Split: bottom window for the manager
-    (let ((manager-win (split-window-below -15)))
-      (select-window manager-win)
-      (switch-to-buffer mgr-buf)
-      (agent-shell-manager-refresh)
-      (setq agent-shell-manager-preview-active t)
-      (add-hook 'post-command-hook #'agent-shell-manager--preview-update nil t)
-      (agent-shell-manager--preview-update)
-      (message "Preview mode: j/k navigate, RET select, q quit"))))
+  (if agent-shell-manager-preview-active
+      (message "Already in preview mode")
+    (setq agent-shell-manager-preview-saved-config (current-window-configuration))
+    (let ((mgr-buf (or agent-shell-manager--global-buffer
+                       (get-buffer "*Agent-Shell Buffers*"))))
+      (unless mgr-buf
+        (user-error "No manager buffer. Open it first with agent-shell-manager-toggle"))
+      ;; Close the manager's side window first — must use window-toggle-side-windows
+      ;; or set the window parameter to allow deletion, since side windows resist
+      ;; delete-window and delete-other-windows by default.
+      (let ((mgr-win (get-buffer-window mgr-buf)))
+        (when (and mgr-win (window-live-p mgr-win))
+          (set-window-parameter mgr-win 'no-delete-other-windows nil)
+          (when (eq (selected-window) mgr-win)
+            (select-window (window-main-window)))
+          (delete-window mgr-win)))
+      ;; Clean slate
+      (delete-other-windows)
+      ;; Current window becomes the preview pane (top, large)
+      (let ((first-shell (car (agent-shell-buffers))))
+        (when first-shell
+          (setq agent-shell-manager-preview-buffer first-shell)
+          (set-window-buffer (selected-window) first-shell)))
+      ;; Split: bottom window for the manager
+      (let ((manager-win (split-window-below -15)))
+        (select-window manager-win)
+        (switch-to-buffer mgr-buf)
+        (agent-shell-manager-refresh)
+        (setq agent-shell-manager-preview-active t)
+        (add-hook 'post-command-hook #'agent-shell-manager--preview-update nil t)
+        (agent-shell-manager--preview-update)
+        (message "Preview mode: j/k navigate, RET select, q quit")))))
 
 (defun agent-shell-manager-exit-preview ()
   "Exit preview mode and restore original window configuration."
