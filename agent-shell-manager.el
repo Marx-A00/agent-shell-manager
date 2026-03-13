@@ -601,16 +601,14 @@ and manager on bottom (15 lines)."
                        (get-buffer "*Agent-Shell Buffers*"))))
       (unless mgr-buf
         (user-error "No manager buffer. Open it first with agent-shell-manager-toggle"))
-      ;; Close the manager's side window first — must use window-toggle-side-windows
-      ;; or set the window parameter to allow deletion, since side windows resist
-      ;; delete-window and delete-other-windows by default.
-      (let ((mgr-win (get-buffer-window mgr-buf)))
-        (when (and mgr-win (window-live-p mgr-win))
-          (set-window-parameter mgr-win 'no-delete-other-windows nil)
-          (when (eq (selected-window) mgr-win)
-            (select-window (window-main-window)))
-          (delete-window mgr-win)))
-      ;; Clean slate
+      ;; Tear down side windows so we get a clean frame for the preview layout.
+      ;; window-toggle-side-windows cleanly removes all side windows at once,
+      ;; avoiding issues with dead window references from window-main-window.
+      (when (window-parameter (get-buffer-window mgr-buf) 'window-side)
+        (window-toggle-side-windows))
+      ;; Now select a live window and clean slate
+      (when (not (window-live-p (selected-window)))
+        (select-window (frame-first-window)))
       (delete-other-windows)
       ;; Current window becomes the preview pane (top, large)
       (let ((first-shell (car (agent-shell-buffers))))
