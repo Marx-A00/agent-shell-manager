@@ -94,6 +94,11 @@ the manager window can also be closed by `delete-other-windows' (C-x 1)."
 (defvar agent-shell-manager--global-buffer nil
   "The global manager buffer for `agent-shell' buffer list.")
 
+(defvar agent-shell-manager-after-refresh-hook nil
+  "Hook run after `agent-shell-manager-refresh' reprints the buffer.
+Preview mode uses this to re-sync overlay and preview pane after
+timer-driven refreshes (where `post-command-hook' does not fire).")
+
 ;; ============================================================
 ;; Preview Mode
 ;; ============================================================
@@ -111,7 +116,7 @@ the manager window can also be closed by `delete-other-windows' (C-x 1)."
   "Overlay used to highlight the current row during preview mode.")
 
 (defface agent-shell-manager-preview-highlight
-  '((t :background "#3c3836" :extend t))
+  '((t :background "#32302f" :underline (:color "#d65d0e" :style line) :extend t))
   "Face for the currently previewed entry in the manager.")
 
 ;; ============================================================
@@ -140,7 +145,7 @@ the manager window can also be closed by `delete-other-windows' (C-x 1)."
          ("Pending Permissions" 20 t)
          ("Path" 20 t)])
   (setq tabulated-list-padding 2)
-  (setq tabulated-list-sort-key (cons "Buffer" nil))
+  (setq tabulated-list-groups #'agent-shell-manager--groups)
   (tabulated-list-init-header)
 
   (when agent-shell-manager--refresh-timer
@@ -335,16 +340,18 @@ Uses projectile if available, falls back to `default-directory'."
          default-directory))))
 
 ;; ============================================================
-;; Entries (with filtering + project sorting)
+;; Data: Grouped Entries (filtering + project grouping)
 ;; ============================================================
 
-(defun agent-shell-manager--entries ()
-  "Return list of entries for tabulated-list.
-Applies status filtering and sorts by project root with killed buffers
-at the bottom of each group."
+(defun agent-shell-manager--groups ()
+  "Return entries grouped by project root for `tabulated-list-groups'.
+Each group is (GROUP-NAME ENTRIES) where GROUP-NAME is a formatted
+project path string and ENTRIES is a list of (BUFFER [COLUMNS...]).
+Applies status filtering. Killed buffers sort to bottom within each group."
   (let* ((buffers (agent-shell-buffers))
          (buffers (if (listp buffers) buffers (list buffers)))
          (buffers (seq-filter #'buffer-live-p buffers))
+         ;; Build entries
          (entries (mapcar
                    (lambda (buffer)
                      (let* ((buffer-name (buffer-name buffer))
@@ -354,13 +361,7 @@ at the bottom of each group."
                             (perms (agent-shell-manager--count-pending-permissions buffer))
                             (path (abbreviate-file-name (agent-shell-manager--get-cwd buffer))))
                        (list buffer
-                             (vector
-                              buffer-name
-                              status
-                              mode
-                              model
-                              perms
-                              path))))
+                             (vector buffer-name status mode model perms path))))
                    buffers))
          ;; Apply status filter
          (entries (if agent-shell-manager-filter-status
@@ -370,139 +371,76 @@ at the bottom of each group."
                            (string-equal-ignore-case status agent-shell-manager-filter-status)))
                        entries)
                     entries))
-         ;; Annotate with project root for sorting
-         (annotated (mapcar
-                     (lambda (entry)
-                       (let* ((buffer (car entry))
-                              (project (if (buffer-live-p buffer)
-                                           (agent-shell-manager--buffer-project-root buffer)
-                                         "~/")))
-                         (cons project entry)))
-                     entries)))
-    ;; Sort by project (alpha), killed-to-bottom within each group
-    (setq annotated
-          (sort annotated
-                (lambda (a b)
-                  (let ((proj-a (car a))
-                        (proj-b (car b))
-                        (status-a (substring-no-properties (aref (caddr a) 1)))
-                        (status-b (substring-no-properties (aref (caddr b) 1))))
-                    (cond
-                     ((not (string= proj-a proj-b))
-                      (string< proj-a proj-b))
-                     ((and (string= status-a "Killed") (not (string= status-b "Killed")))
-                      nil)
-                     ((and (not (string= status-a "Killed")) (string= status-b "Killed"))
-                      t)
-                     (t nil))))))
-    ;; Strip project annotations
-    (mapcar #'cdr annotated)))
-
-;; ============================================================
-;; Group Headers
-;; ============================================================
-
-(defun agent-shell-manager--inject-group-headers ()
-  "Insert visual group headers between project boundaries.
-Headers have `agent-shell-manager-group-header' text property for cleanup."
-  (when (derived-mode-p 'agent-shell-manager-mode)
-    (let ((inhibit-read-only t)
-          (last-project nil))
-      (save-excursion
-        (goto-char (point-min))
-        (while (not (eobp))
-          (let* ((entry-buffer (tabulated-list-get-id))
-                 (project (when (and entry-buffer (buffer-live-p entry-buffer))
-                            (agent-shell-manager--buffer-project-root entry-buffer))))
-            (when (and project (not (equal project last-project)))
-              (let* ((header-text (concat "-- " project " "
-                                          (make-string (max 1 (- 60 (length project) 4)) ?-)
-                                          "\n"))
-                     (propertized (propertize header-text
-                                             'face 'font-lock-comment-face
-                                             'agent-shell-manager-group-header t)))
-                (insert propertized))
-              (setq last-project project)))
-          (forward-line 1))))))
-
-(defun agent-shell-manager--remove-group-headers ()
-  "Remove all group header lines from the manager buffer."
-  (when (derived-mode-p 'agent-shell-manager-mode)
-    (let ((inhibit-read-only t))
-      (save-excursion
-        (goto-char (point-min))
-        (while (not (eobp))
-          (if (get-text-property (point) 'agent-shell-manager-group-header)
-              (delete-region (line-beginning-position) (1+ (line-end-position)))
-            (forward-line 1)))))))
+         ;; Group by project root
+         (groups (make-hash-table :test #'equal)))
+    ;; Bucket entries by project
+    (dolist (entry entries)
+      (let* ((buffer (car entry))
+             (project (if (buffer-live-p buffer)
+                          (agent-shell-manager--buffer-project-root buffer)
+                        "~/")))
+        (puthash project (cons entry (gethash project groups)) groups)))
+    ;; Build sorted group list
+    (let ((result nil))
+      (maphash
+       (lambda (project group-entries)
+         ;; Sort killed buffers to bottom within group
+         (setq group-entries
+               (sort (nreverse group-entries)
+                     (lambda (a b)
+                       (let ((sa (substring-no-properties (aref (cadr a) 1)))
+                             (sb (substring-no-properties (aref (cadr b) 1))))
+                         (cond
+                          ((and (string= sa "Killed") (not (string= sb "Killed"))) nil)
+                          ((and (not (string= sa "Killed")) (string= sb "Killed")) t)
+                          (t nil))))))
+         ;; Format group name
+         (let ((name (propertize
+                      (concat " " project " "
+                              (make-string (max 1 (- 60 (length project) 2)) ?-))
+                      'face 'font-lock-comment-face)))
+           (push (cons name group-entries) result)))
+       groups)
+      ;; Sort groups alphabetically by project path
+      (sort result (lambda (a b) (string< (car a) (car b)))))))
 
 (defun agent-shell-manager--skip-group-headers ()
-  "Post-command-hook to skip cursor past group header lines."
-  (when (and (derived-mode-p 'agent-shell-manager-mode)
-             (get-text-property (line-beginning-position) 'agent-shell-manager-group-header))
-    (let ((direction (cond
-                      ((memq this-command '(next-line evil-next-line evil-next-visual-line
-                                            evil-goto-line)) 1)
-                      ((memq this-command '(previous-line evil-previous-line evil-previous-visual-line
-                                            evil-goto-first-line)) -1)
-                      (t nil))))
-      (when direction
+  "Post-command-hook to skip cursor past group header lines.
+Group headers inserted by `tabulated-list-groups' have no entry ID,
+so `tabulated-list-get-id' returns nil on those lines.
+Also triggers preview update after cursor settles, ensuring preview
+always sees the final cursor position (not an intermediate header line)."
+  (when (derived-mode-p 'agent-shell-manager-mode)
+    (when (null (tabulated-list-get-id))
+      (let ((direction (cond
+                        ((memq this-command '(next-line evil-next-line evil-next-visual-line
+                                              evil-goto-line)) 1)
+                        ((memq this-command '(previous-line evil-previous-line evil-previous-visual-line
+                                              evil-goto-first-line)) -1)
+                        (t 1))))
         (forward-line direction)
         (while (and (not (eobp)) (not (bobp))
-                    (get-text-property (line-beginning-position) 'agent-shell-manager-group-header))
+                    (null (tabulated-list-get-id)))
           (forward-line direction))
-        (when (eobp) (forward-line -1))))))
+        (when (eobp) (forward-line -1))))
+    ;; Always update preview after cursor has settled
+    (agent-shell-manager--preview-update)))
 
 ;; ============================================================
-;; Refresh (with group headers, no scroll drift)
+;; Refresh
 ;; ============================================================
 
 (defun agent-shell-manager-refresh ()
-  "Refresh the buffer list with group headers.
-Preserves cursor position on the same entry. Only restores scroll
-position when the manager window is actively selected to prevent
-drift from the auto-refresh timer."
+  "Refresh the buffer list.
+Uses `tabulated-list-print' with REMEMBER-POS to preserve cursor.
+Group headers are handled natively by `tabulated-list-groups'.
+Runs `agent-shell-manager-after-refresh-hook' so preview mode can re-sync."
   (interactive)
   (when (and agent-shell-manager--global-buffer
              (buffer-live-p agent-shell-manager--global-buffer))
     (with-current-buffer agent-shell-manager--global-buffer
-      (let* ((target-buf (tabulated-list-get-id))
-             (mgr-win (get-buffer-window (current-buffer)))
-             ;; Only track scroll when we're the selected window
-             (is-selected (eq mgr-win (selected-window)))
-             (line-offset (when (and is-selected mgr-win)
-                            (count-lines (window-start mgr-win) (point)))))
-        ;; Remove old headers, refresh data, re-inject headers
-        (agent-shell-manager--remove-group-headers)
-        (setq tabulated-list-entries (agent-shell-manager--entries))
-        (tabulated-list-print t)
-        (agent-shell-manager--inject-group-headers)
-        ;; Restore cursor to the same buffer entry
-        (when target-buf
-          (goto-char (point-min))
-          (let ((found nil))
-            (while (and (not found) (not (eobp)))
-              (if (eq (tabulated-list-get-id) target-buf)
-                  (setq found t)
-                (forward-line 1)))))
-        ;; Only restore scroll when we're the active window
-        (when (and is-selected mgr-win (window-live-p mgr-win) line-offset)
-          (set-window-start mgr-win
-                            (save-excursion
-                              (forward-line (- line-offset))
-                              (point))
-                            t))
-        ;; Re-apply highlight overlay if preview mode is active
-        (when agent-shell-manager-preview-active
-          (if (and agent-shell-manager-preview-highlight-overlay
-                   (overlay-buffer agent-shell-manager-preview-highlight-overlay))
-              (move-overlay agent-shell-manager-preview-highlight-overlay
-                            (line-beginning-position) (1+ (line-end-position)))
-            (setq agent-shell-manager-preview-highlight-overlay
-                  (make-overlay (line-beginning-position) (1+ (line-end-position))))
-            (overlay-put agent-shell-manager-preview-highlight-overlay
-                         'face 'agent-shell-manager-preview-highlight)
-            (overlay-put agent-shell-manager-preview-highlight-overlay 'priority 100)))))))
+      (tabulated-list-print t)
+      (run-hooks 'agent-shell-manager-after-refresh-hook))))
 
 ;; ============================================================
 ;; Status Filtering UI
@@ -562,8 +500,11 @@ Walks all windows and returns the one NOT showing the manager buffer."
       result)))
 
 (defun agent-shell-manager--preview-update ()
-  "Update the preview pane to show the buffer under cursor.
-Called via `post-command-hook' in the manager buffer."
+  "Update the preview highlight and pane to match cursor position.
+Called via `post-command-hook' (user commands) and
+`agent-shell-manager-after-refresh-hook' (timer-driven refreshes).
+Does nothing if on a group header (nil ID) — the skip-headers hook
+will move cursor to a real entry, which re-triggers this via post-command-hook."
   (when (and agent-shell-manager-preview-active
              (derived-mode-p 'agent-shell-manager-mode))
     ;; Update highlight overlay on current line
@@ -576,7 +517,7 @@ Called via `post-command-hook' in the manager buffer."
       (overlay-put agent-shell-manager-preview-highlight-overlay
                    'face 'agent-shell-manager-preview-highlight)
       (overlay-put agent-shell-manager-preview-highlight-overlay 'priority 100))
-    ;; Update preview pane
+    ;; Update preview pane (only for real entries, not group headers)
     (when-let* ((buffer (tabulated-list-get-id)))
       (when (buffer-live-p buffer)
         (let ((preview-win (agent-shell-manager--preview-window))
@@ -588,6 +529,12 @@ Called via `post-command-hook' in the manager buffer."
               (with-selected-window preview-win
                 (goto-char (point-max))
                 (recenter -3)))))))))
+
+(defun agent-shell-manager--preview-after-refresh ()
+  "Re-sync preview state after a timer-driven refresh.
+Hooked into `agent-shell-manager-after-refresh-hook' while preview is active."
+  (when agent-shell-manager-preview-active
+    (agent-shell-manager--preview-update)))
 
 (defun agent-shell-manager-enter-preview ()
   "Enter preview mode.
@@ -621,7 +568,7 @@ and manager on bottom (15 lines)."
         (switch-to-buffer mgr-buf)
         (agent-shell-manager-refresh)
         (setq agent-shell-manager-preview-active t)
-        (add-hook 'post-command-hook #'agent-shell-manager--preview-update nil t)
+        (add-hook 'agent-shell-manager-after-refresh-hook #'agent-shell-manager--preview-after-refresh)
         (agent-shell-manager--preview-update)
         (message "Preview mode: j/k navigate, RET select, q quit")))))
 
@@ -629,7 +576,7 @@ and manager on bottom (15 lines)."
   "Exit preview mode and restore original window configuration."
   (setq agent-shell-manager-preview-active nil)
   (setq agent-shell-manager-preview-buffer nil)
-  (remove-hook 'post-command-hook #'agent-shell-manager--preview-update t)
+  (remove-hook 'agent-shell-manager-after-refresh-hook #'agent-shell-manager--preview-after-refresh)
   (when (and agent-shell-manager-preview-highlight-overlay
              (overlay-buffer agent-shell-manager-preview-highlight-overlay))
     (delete-overlay agent-shell-manager-preview-highlight-overlay))
@@ -868,6 +815,32 @@ If `agent-shell-manager-transient' is non-nil, hide the manager window."
           (agent-shell-manager-refresh))
         (set-window-dedicated-p window t)
         (select-window window)))))
+
+;; ============================================================
+;; Test Harness
+;; ============================================================
+
+;;;###autoload
+(defun agent-shell-manager-spawn-test-env ()
+  "Spawn test agent-shell buffers across multiple projects.
+Creates 2 shells in each of 3 project directories with identifying
+messages, then opens the buffer manager for testing preview mode,
+project grouping, and status filtering."
+  (interactive)
+  (let ((projects '(("~/.dotfiles/" . "dotfiles")
+                    ("~/roaming/claude/" . "claude")
+                    ("~/roaming/projects/blog/" . "blog")))
+        (count 0))
+    (dolist (proj projects)
+      (let ((default-directory (expand-file-name (car proj)))
+            (label (cdr proj)))
+        (dotimes (i 2)
+          (setq count (1+ count))
+          (agent-shell t)
+          (goto-char (point-max))
+          (insert (format "test shell %d — %s (%d)" count label (1+ i))))))
+    (agent-shell-manager-toggle)
+    (message "Spawned %d test shells across %d projects." count (length projects))))
 
 (provide 'agent-shell-manager)
 
