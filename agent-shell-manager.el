@@ -93,6 +93,7 @@ Automatically set to the previously-active frame when
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map tabulated-list-mode-map)
     (define-key map (kbd "RET") #'agent-shell-manager-goto)
+    (define-key map (kbd "o") #'agent-shell-manager-peek)
     (define-key map (kbd "g") #'agent-shell-manager-refresh)
     (define-key map (kbd "q") #'quit-window)
     (define-key map (kbd "k") #'agent-shell-manager-kill)
@@ -173,6 +174,9 @@ timer-driven refreshes (where `post-command-hook' does not fire).")
   ;; Set up auto-refresh timer (refresh every 2 seconds)
   (setq agent-shell-manager--refresh-timer
         (run-with-timer 2 2 #'agent-shell-manager-refresh))
+
+  ;; Line numbers for quick navigation
+  (display-line-numbers-mode 1)
 
   ;; Highlight current line during navigation
   (hl-line-mode 1)
@@ -724,6 +728,40 @@ If `agent-shell-manager-transient' is non-nil, hide the manager window."
               (unless switched-persp
                 (agent-shell-manager--hide-window)))))
       (user-error "Buffer no longer exists"))))
+
+(defun agent-shell-manager-peek ()
+  "Display the agent-shell buffer at point without switching focus.
+In frame mode, shows the buffer in the target frame.  Otherwise,
+shows it in another window.  Focus remains in the manager.
+Scrolls the displayed buffer to the latest output."
+  (interactive)
+  (when-let* ((buffer (tabulated-list-get-id)))
+    (unless (buffer-live-p buffer)
+      (user-error "Buffer no longer exists"))
+    (let ((win
+           (if (and (agent-shell-manager--in-manager-frame-p)
+                    (agent-shell-manager--target-frame-live-p))
+               ;; Find/reuse a window in the target frame
+               (let ((target agent-shell-manager--target-frame))
+                 (or (get-buffer-window buffer target)
+                     (let ((found nil))
+                       (walk-windows
+                        (lambda (w)
+                          (when (and (not found)
+                                     (with-current-buffer (window-buffer w)
+                                       (derived-mode-p 'agent-shell-mode)))
+                            (setq found w)))
+                        nil target)
+                       found)
+                     (frame-selected-window target)))
+             ;; Same-frame: pop in another window
+             (display-buffer buffer '((display-buffer-use-some-window)
+                                      (inhibit-same-window . t))))))
+      (when win
+        (set-window-buffer win buffer)
+        (with-selected-window win
+          (goto-char (point-max))
+          (recenter -3))))))
 
 (defun agent-shell-manager-kill ()
   "Kill the `agent-shell' process at point."
