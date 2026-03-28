@@ -70,6 +70,25 @@ the manager window can also be closed by `delete-other-windows' (C-x 1)."
   :type 'boolean
   :group 'agent-shell-manager)
 
+(defcustom agent-shell-manager-frame-alist
+  '((name . "Agent Shell Manager")
+    (width . 110)
+    (height . 30)
+    (minibuffer . t))
+  "Frame parameters for the dedicated manager frame.
+Used by `agent-shell-manager-toggle-frame' when creating the
+standalone manager frame."
+  :type '(alist :key-type symbol :value-type sexp)
+  :group 'agent-shell-manager)
+
+(defvar agent-shell-manager--frame nil
+  "The dedicated frame for the agent-shell manager, if any.")
+
+(defvar agent-shell-manager--target-frame nil
+  "Frame where shells are displayed when selected from the manager frame.
+Automatically set to the previously-active frame when
+`agent-shell-manager-toggle-frame' creates the manager frame.")
+
 (defvar agent-shell-manager-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map tabulated-list-mode-map)
@@ -154,6 +173,9 @@ timer-driven refreshes (where `post-command-hook' does not fire).")
   ;; Set up auto-refresh timer (refresh every 2 seconds)
   (setq agent-shell-manager--refresh-timer
         (run-with-timer 2 2 #'agent-shell-manager-refresh))
+
+  ;; Highlight current line during navigation
+  (hl-line-mode 1)
 
   ;; Skip group header lines during navigation
   (add-hook 'post-command-hook #'agent-shell-manager--skip-group-headers nil t)
@@ -440,6 +462,10 @@ Runs `agent-shell-manager-after-refresh-hook' so preview mode can re-sync."
              (buffer-live-p agent-shell-manager--global-buffer))
     (with-current-buffer agent-shell-manager--global-buffer
       (tabulated-list-print t)
+      ;; Re-apply hl-line highlight — tabulated-list-print rebuilds the
+      ;; buffer contents which destroys the hl-line overlay.
+      (when (bound-and-true-p hl-line-mode)
+        (hl-line-highlight))
       (run-hooks 'agent-shell-manager-after-refresh-hook))))
 
 ;; ============================================================
@@ -620,32 +646,83 @@ If preview mode is active, exit preview. Otherwise close normally."
                              (get-buffer-window buffer))))
       (delete-window window))))
 
+(defun agent-shell-manager--goto-in-target-frame (buffer)
+  "Display BUFFER in the target frame and switch focus to it.
+Used when the manager is running in its own dedicated frame."
+  (let ((target agent-shell-manager--target-frame))
+    (raise-frame target)
+    (select-frame-set-input-focus target)
+    ;; Try to find the buffer already visible in the target frame
+    (let ((buffer-window (get-buffer-window buffer target)))
+      (if buffer-window
+          (select-window buffer-window)
+        ;; Try to reuse an existing agent-shell window in the target frame
+        (let ((agent-window nil))
+          (walk-windows
+           (lambda (win)
+             (when (and (not agent-window)
+                        (with-current-buffer (window-buffer win)
+                          (derived-mode-p 'agent-shell-mode)))
+               (setq agent-window win)))
+           nil target)
+          (if agent-window
+              (progn
+                (set-window-buffer agent-window buffer)
+                (select-window agent-window))
+            ;; Last resort: use the selected window in the target frame
+            (set-window-buffer (frame-selected-window target) buffer)
+            (select-window (frame-selected-window target))))))))
+
 (defun agent-shell-manager-goto ()
   "Go to the `agent-shell' buffer at point.
+If called from the dedicated manager frame (created by
+`agent-shell-manager-toggle-frame'), displays the buffer in the
+target frame instead of the current one.
+If the buffer belongs to a different perspective (and `persp-mode' is
+active), switch to that perspective first — restoring its full window
+configuration — then select the buffer's window within it.
 If `agent-shell-manager-transient' is non-nil, hide the manager window."
   (interactive)
   (when-let* ((buffer (tabulated-list-get-id)))
     (if (buffer-live-p buffer)
-        (let ((buffer-window (get-buffer-window buffer t))
-              (agent-shell-window nil))
-          (cond
-           (buffer-window
-            (select-window buffer-window))
-           (t
-            (walk-windows
-             (lambda (win)
-               (when (and (not agent-shell-window)
-                          (not (eq win (selected-window)))
-                          (with-current-buffer (window-buffer win)
-                            (derived-mode-p 'agent-shell-mode)))
-                 (setq agent-shell-window win)))
-             nil t)
-            (if agent-shell-window
-                (progn
-                  (set-window-buffer agent-shell-window buffer)
-                  (select-window agent-shell-window))
-              (agent-shell--display-buffer buffer))))
-          (agent-shell-manager--hide-window))
+        (if (and (agent-shell-manager--in-manager-frame-p)
+                 (agent-shell-manager--target-frame-live-p))
+            ;; Cross-frame: display in the target frame
+            (agent-shell-manager--goto-in-target-frame buffer)
+          ;; Same-frame: original behavior
+          (let ((switched-persp nil))
+            ;; Perspective-aware: if the buffer lives in another perspective,
+            ;; switch to it so its window layout is restored.
+            (when (bound-and-true-p persp-mode)
+              (let ((other-persp (persp-buffer-in-other-p buffer)))
+                (when (and other-persp
+                           (eq (car other-persp) (selected-frame)))
+                  (agent-shell-manager--hide-window)
+                  (persp-switch (cdr other-persp))
+                  (setq switched-persp t))))
+            ;; After a perspective switch, the buffer's window is likely
+            ;; already visible in the restored layout — just select it.
+            (let ((buffer-window (get-buffer-window buffer))
+                  (agent-shell-window nil))
+              (cond
+               (buffer-window
+                (select-window buffer-window))
+               (t
+                (walk-windows
+                 (lambda (win)
+                   (when (and (not agent-shell-window)
+                              (not (eq win (selected-window)))
+                              (with-current-buffer (window-buffer win)
+                                (derived-mode-p 'agent-shell-mode)))
+                     (setq agent-shell-window win)))
+                 nil t)
+                (if agent-shell-window
+                    (progn
+                      (set-window-buffer agent-shell-window buffer)
+                      (select-window agent-shell-window))
+                  (agent-shell--display-buffer buffer))))
+              (unless switched-persp
+                (agent-shell-manager--hide-window)))))
       (user-error "Buffer no longer exists"))))
 
 (defun agent-shell-manager-kill ()
@@ -666,12 +743,25 @@ If `agent-shell-manager-transient' is non-nil, hide the manager window."
       (run-with-timer 0.1 nil #'agent-shell-manager-refresh))))
 
 (defun agent-shell-manager-new ()
-  "Create a new `agent-shell'."
+  "Create a new `agent-shell'.
+When called from the dedicated manager frame, creates the shell
+in the target frame and keeps focus in the manager."
   (interactive)
-  (agent-shell t)
-  (if agent-shell-manager-transient
-      (agent-shell-manager--hide-window)
-    (agent-shell-manager-refresh)))
+  (if (and (agent-shell-manager--in-manager-frame-p)
+           (agent-shell-manager--target-frame-live-p))
+      ;; Cross-frame: create in target, stay in manager
+      (let ((mgr-frame (selected-frame))
+            (target agent-shell-manager--target-frame))
+        (select-frame-set-input-focus target)
+        (agent-shell t)
+        ;; Return focus to the manager frame
+        (select-frame-set-input-focus mgr-frame)
+        (agent-shell-manager-refresh))
+    ;; Same-frame: original behavior
+    (agent-shell t)
+    (if agent-shell-manager-transient
+        (agent-shell-manager--hide-window)
+      (agent-shell-manager-refresh))))
 
 (defun agent-shell-manager--get-buffer-config (buffer)
   "Try to determine the config used for BUFFER."
@@ -779,8 +869,62 @@ If `agent-shell-manager-transient' is non-nil, hide the manager window."
   (agent-shell-manager-refresh))
 
 ;; ============================================================
+;; Frame Helpers
+;; ============================================================
+
+(defun agent-shell-manager--in-manager-frame-p ()
+  "Return non-nil if the current frame is the dedicated manager frame."
+  (and agent-shell-manager--frame
+       (frame-live-p agent-shell-manager--frame)
+       (eq (selected-frame) agent-shell-manager--frame)))
+
+(defun agent-shell-manager--target-frame-live-p ()
+  "Return non-nil if a live target frame exists for cross-frame display."
+  (and agent-shell-manager--target-frame
+       (frame-live-p agent-shell-manager--target-frame)))
+
+(defun agent-shell-manager--frame-cleanup (frame)
+  "Clean up tracking variables when the manager FRAME is deleted."
+  (when (eq frame agent-shell-manager--frame)
+    (setq agent-shell-manager--frame nil)
+    (setq agent-shell-manager--target-frame nil)))
+
+;; ============================================================
 ;; Toggle
 ;; ============================================================
+
+;;;###autoload
+(defun agent-shell-manager-toggle-frame ()
+  "Toggle the agent-shell manager in a dedicated frame.
+Creates a separate frame showing the manager buffer.  Shells
+selected with RET are displayed in the frame that was active
+before this frame was created (the \"target\" frame).
+
+If the manager frame already exists, raise it.  If called from
+the manager frame itself, delete it."
+  (interactive)
+  (cond
+   ;; Called from the manager frame — close it
+   ((agent-shell-manager--in-manager-frame-p)
+    (delete-frame agent-shell-manager--frame))
+   ;; Manager frame exists elsewhere — raise it
+   ((and agent-shell-manager--frame
+         (frame-live-p agent-shell-manager--frame))
+    (raise-frame agent-shell-manager--frame)
+    (select-frame-set-input-focus agent-shell-manager--frame))
+   ;; Create new manager frame
+   (t
+    (setq agent-shell-manager--target-frame (selected-frame))
+    (let* ((buffer (get-buffer-create "*Agent-Shell Buffers*"))
+           (frame (make-frame agent-shell-manager-frame-alist)))
+      (setq agent-shell-manager--frame frame)
+      (select-frame-set-input-focus frame)
+      (set-window-buffer (frame-selected-window frame) buffer)
+      (setq agent-shell-manager--global-buffer buffer)
+      (with-current-buffer buffer
+        (agent-shell-manager-mode)
+        (agent-shell-manager-refresh))
+      (add-hook 'delete-frame-functions #'agent-shell-manager--frame-cleanup)))))
 
 ;;;###autoload
 (defun agent-shell-manager-toggle ()
@@ -813,7 +957,6 @@ If `agent-shell-manager-transient' is non-nil, hide the manager window."
         (with-current-buffer buffer
           (agent-shell-manager-mode)
           (agent-shell-manager-refresh))
-        (set-window-dedicated-p window t)
         (select-window window)))))
 
 ;; ============================================================
