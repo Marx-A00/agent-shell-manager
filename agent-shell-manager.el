@@ -506,10 +506,15 @@ Runs `agent-shell-manager-after-refresh-hook' so preview mode can re-sync."
 
 (defun agent-shell-manager--preview-window ()
   "Find the preview window dynamically.
-Walks all windows and returns the one NOT showing the manager buffer."
+Walks all windows and returns the one NOT showing the manager buffer.
+When in the dedicated manager frame, searches the target frame instead."
   (when agent-shell-manager-preview-active
-    (let ((mgr-buf (get-buffer "*Agent-Shell Buffers*"))
-          (result nil))
+    (let* ((mgr-buf (get-buffer "*Agent-Shell Buffers*"))
+           (search-frame (if (and (agent-shell-manager--in-manager-frame-p)
+                                  (agent-shell-manager--target-frame-live-p))
+                             agent-shell-manager--target-frame
+                           (selected-frame)))
+           (result nil))
       ;; First try: find window showing our preview buffer
       (when agent-shell-manager-preview-buffer
         (walk-windows
@@ -518,7 +523,7 @@ Walks all windows and returns the one NOT showing the manager buffer."
                       (not (eq (window-buffer w) mgr-buf))
                       (eq (window-buffer w) agent-shell-manager-preview-buffer))
              (setq result w)))
-         nil (selected-frame)))
+         nil search-frame))
       ;; Fallback: any non-manager window
       (unless result
         (walk-windows
@@ -526,7 +531,7 @@ Walks all windows and returns the one NOT showing the manager buffer."
            (when (and (not result)
                       (not (eq (window-buffer w) mgr-buf)))
              (setq result w)))
-         nil (selected-frame)))
+         nil search-frame))
       result)))
 
 (defun agent-shell-manager--preview-update ()
@@ -568,42 +573,53 @@ Hooked into `agent-shell-manager-after-refresh-hook' while preview is active."
 
 (defun agent-shell-manager-enter-preview ()
   "Enter preview mode.
-Saves window config, creates split layout with preview on top
-and manager on bottom (15 lines)."
+In the dedicated manager frame, previews are shown in the target
+frame — the manager stays full-frame.  Otherwise, creates a split
+layout with preview on top and manager on bottom (15 lines)."
   (interactive)
   (if agent-shell-manager-preview-active
       (message "Already in preview mode")
-    (setq agent-shell-manager-preview-saved-config (current-window-configuration))
-    (let ((mgr-buf (or agent-shell-manager--global-buffer
-                       (get-buffer "*Agent-Shell Buffers*"))))
-      (unless mgr-buf
-        (user-error "No manager buffer. Open it first with agent-shell-manager-toggle"))
-      ;; Tear down side windows so we get a clean frame for the preview layout.
-      ;; window-toggle-side-windows cleanly removes all side windows at once,
-      ;; avoiding issues with dead window references from window-main-window.
-      (when (window-parameter (get-buffer-window mgr-buf) 'window-side)
-        (window-toggle-side-windows))
-      ;; Now select a live window and clean slate
-      (when (not (window-live-p (selected-window)))
-        (select-window (frame-first-window)))
-      (delete-other-windows)
-      ;; Current window becomes the preview pane (top, large)
-      (let ((first-shell (car (agent-shell-buffers))))
-        (when first-shell
-          (setq agent-shell-manager-preview-buffer first-shell)
-          (set-window-buffer (selected-window) first-shell)))
-      ;; Split: bottom window for the manager
-      (let ((manager-win (split-window-below -15)))
-        (select-window manager-win)
-        (switch-to-buffer mgr-buf)
-        (agent-shell-manager-refresh)
-        (setq agent-shell-manager-preview-active t)
-        (add-hook 'agent-shell-manager-after-refresh-hook #'agent-shell-manager--preview-after-refresh)
-        (agent-shell-manager--preview-update)
-        (message "Preview mode: j/k navigate, RET select, q quit")))))
+    (if (and (agent-shell-manager--in-manager-frame-p)
+             (agent-shell-manager--target-frame-live-p))
+        ;; Cross-frame preview: no split needed, target frame IS the preview
+        (progn
+          (setq agent-shell-manager-preview-active t)
+          (add-hook 'agent-shell-manager-after-refresh-hook
+                    #'agent-shell-manager--preview-after-refresh)
+          (agent-shell-manager--preview-update)
+          (message "Preview mode (cross-frame): j/k navigate, RET select, q quit"))
+      ;; Same-frame preview: split layout
+      (setq agent-shell-manager-preview-saved-config (current-window-configuration))
+      (let ((mgr-buf (or agent-shell-manager--global-buffer
+                         (get-buffer "*Agent-Shell Buffers*"))))
+        (unless mgr-buf
+          (user-error "No manager buffer. Open it first with agent-shell-manager-toggle"))
+        ;; Tear down side windows so we get a clean frame for the preview layout.
+        (when (window-parameter (get-buffer-window mgr-buf) 'window-side)
+          (window-toggle-side-windows))
+        ;; Now select a live window and clean slate
+        (when (not (window-live-p (selected-window)))
+          (select-window (frame-first-window)))
+        (delete-other-windows)
+        ;; Current window becomes the preview pane (top, large)
+        (let ((first-shell (car (agent-shell-buffers))))
+          (when first-shell
+            (setq agent-shell-manager-preview-buffer first-shell)
+            (set-window-buffer (selected-window) first-shell)))
+        ;; Split: bottom window for the manager
+        (let ((manager-win (split-window-below -15)))
+          (select-window manager-win)
+          (switch-to-buffer mgr-buf)
+          (agent-shell-manager-refresh)
+          (setq agent-shell-manager-preview-active t)
+          (add-hook 'agent-shell-manager-after-refresh-hook
+                    #'agent-shell-manager--preview-after-refresh)
+          (agent-shell-manager--preview-update)
+          (message "Preview mode: j/k navigate, RET select, q quit"))))))
 
 (defun agent-shell-manager-exit-preview ()
-  "Exit preview mode and restore original window configuration."
+  "Exit preview mode and restore original window configuration.
+In cross-frame mode, just deactivates preview (no config to restore)."
   (setq agent-shell-manager-preview-active nil)
   (setq agent-shell-manager-preview-buffer nil)
   (remove-hook 'agent-shell-manager-after-refresh-hook #'agent-shell-manager--preview-after-refresh)
@@ -611,6 +627,7 @@ and manager on bottom (15 lines)."
              (overlay-buffer agent-shell-manager-preview-highlight-overlay))
     (delete-overlay agent-shell-manager-preview-highlight-overlay))
   (setq agent-shell-manager-preview-highlight-overlay nil)
+  ;; Only restore window config for same-frame preview
   (when agent-shell-manager-preview-saved-config
     (set-window-configuration agent-shell-manager-preview-saved-config)
     (setq agent-shell-manager-preview-saved-config nil)))
